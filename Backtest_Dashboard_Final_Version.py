@@ -14,7 +14,7 @@ ib = IB()
 ib.connect('127.0.0.1', 7497, clientId=1)
 
 # === Define start and end dates ===
-start_date = dt.date(2025, 4, 1)
+start_date = dt.date(2024, 1, 1)
 end_date = dt.date(2025, 7, 1)
 trading_days = pd.bdate_range(start=start_date, end=end_date).to_list()
 
@@ -46,26 +46,77 @@ def calculate_vwap(df):
     df['vwap'] = vwap_numerator / vwap_denominator
     return df
 
-# === Entry/Exit Conditions ===
+# === Entry/Exit Conditions (Short Setup) ===
 def detect_entries_exits(df):
-    df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
+    df = df.copy()
+    df['ema'] = df['close'].ewm(span=9, adjust=False).mean()
     df['entry'] = False
     df['exit'] = False
 
-    for i in range(2, len(df) - 2):
-        if (df.iloc[i-2]['close'] < df.iloc[i-2]['vwap'] and
-            df.iloc[i-1]['close'] < df.iloc[i-1]['vwap'] and
-            df.iloc[i]['close'] > df.iloc[i]['vwap']):
-            df.iloc[i+1, df.columns.get_loc('entry')] = True
+    range_minutes = 6
+    i = range_minutes
+    cutoff_time_reached = False
 
-    position_open = False
-    for i in range(len(df)):
-        if df.iloc[i]['entry']:
-            position_open = True
-        elif position_open:
-            if df.iloc[i]['close'] < df.iloc[i]['vwap'] or df.iloc[i]['close'] < df.iloc[i]['ema9']:
-                df.iloc[i, df.columns.get_loc('exit')] = True
-                position_open = False
+    while i < len(df) - 10 and not cutoff_time_reached:
+        range_df = df.iloc[i - range_minutes:i]
+        range_high = range_df['close'].max()
+        range_low = range_df['open'].min()
+        range_width = range_high - range_low
+        range_max_high = range_df['high'].max()
+        range_min_low = range_df['low'].min()
+
+        trigger_candle = df.iloc[i]
+        if trigger_candle['close'] < range_low - 0.25 * range_width:
+            body = abs(trigger_candle['close'] - trigger_candle['open'])
+            if body > 1.3 * (range_max_high - range_min_low):
+                i += 1
+                continue
+
+            next_candle = df.iloc[i + 1]
+            entry_time = next_candle.name
+
+            if entry_time.time() > dt.time(10, 0):
+                cutoff_time_reached = True
+                break
+
+            if next_candle['low'] < trigger_candle['low']:
+                stop_loss = range_max_high
+                stop_moved = False
+                j = i + 2
+                closes_above_ema = 0
+
+                df.loc[entry_time, 'entry'] = True
+
+                while j < len(df):
+                    bar = df.iloc[j]
+                    bar_time = bar.name
+                    minutes_since_entry = (bar_time - entry_time).total_seconds() / 60
+
+                    if not stop_moved and minutes_since_entry >= 3:
+                        stop_loss = trigger_candle['open']
+                        stop_moved = True
+
+                    if bar['high'] >= stop_loss:
+                        df.loc[bar_time, 'exit'] = True
+                        break
+
+                    if (bar['close'] - bar['ema']) > 0.3 * range_width:
+                        df.loc[bar_time, 'exit'] = True
+                        break
+
+                    if bar['close'] > bar['ema']:
+                        closes_above_ema += 1
+                    else:
+                        closes_above_ema = 0
+
+                    if closes_above_ema >= 3:
+                        df.loc[bar_time, 'exit'] = True
+                        break
+
+                    j += 1
+                i = j
+                continue
+        i += 1
 
     return df
 
@@ -149,8 +200,14 @@ executions = []
 time_buckets = {'Open': [], 'Noon': [], 'EOD': []}
 symbol_pnl = {'SPY': 0.0}
 
+last_reported_month = None
+
 for date in trading_days:
     try:
+        if last_reported_month != date.month:
+            print(f"Processing data for {date.strftime('%B %Y')}")
+            last_reported_month = date.month
+
         df = get_spy_1min_data(date)
         if df is None or df.empty:
             continue
@@ -167,8 +224,7 @@ for date in trading_days:
                 entry_price = df.loc[entry_time]['open']
                 exit_time_actual = exit_time[0]
                 exit_price = df.loc[exit_time_actual]['close']
-                trade_return = (exit_price - entry_price) / entry_price
-                pnl = trade_return * 100
+                pnl = (entry_price - exit_price) * 100  # short entry, raw dollar PnL
                 hold_time = exit_time_actual - entry_time
 
                 hour = entry_time.time().hour
@@ -188,15 +244,12 @@ for date in trading_days:
                     'exit_time': exit_time_actual,
                     'entry_price': entry_price,
                     'exit_price': exit_price,
-                    'return': trade_return,
                     'pnl': pnl,
                     'hold_time': hold_time
                 })
 
                 executions.append(["Entry", entry_time.strftime('%Y-%m-%d %H:%M'), f"{entry_price:.2f}", "100 shares", ""])
                 executions.append(["Exit", exit_time_actual.strftime('%Y-%m-%d %H:%M'), f"{exit_price:.2f}", "100 shares", f"{pnl:+.2f}"])
-
-        time.sleep(1)
 
     except Exception as e:
         print(f"Error on {date}: {e}")
@@ -209,13 +262,7 @@ if not df_results.empty:
     df_results.sort_values(by='exit_time', inplace=True)
     df_results['cum_pnl'] = df_results['pnl'].cumsum()
 
-    avg_return = df_results['return'].mean()
-    downside_std = df_results[df_results['return'] < 0]['return'].std()
-    sortino = avg_return / downside_std * np.sqrt(252) if downside_std != 0 else 0
-
-    win_rate = (df_results['return'] > 0).mean()
-    ev_per_trade = avg_return * 100
-
+    win_rate = (df_results['pnl'] > 0).mean()
     cum_return = df_results['cum_pnl'].iloc[-1]
     drawdown = (df_results['cum_pnl'].cummax() - df_results['cum_pnl'])
     max_drawdown = drawdown.max()
@@ -233,8 +280,6 @@ if not df_results.empty:
         "Total Trades:": len(df_results),
         "Avg Hold Time:": avg_hold_fmt,
         "Win Rate:": f"{win_rate:.2%}",
-        "EV Per Trade:": f"{ev_per_trade:+.2f}%",
-        "Sortino Ratio:": f"{sortino:.2f}",
         "Calmar Ratio:": f"{calmar:.2f}",
         "Cumulative PnL:": f"{cum_return:+.2f}"
     }
